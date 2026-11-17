@@ -586,7 +586,15 @@ defmodule Postgrex.Protocol do
           | {:disconnect, %RuntimeError{}, state}
           | {:disconnect | :disconnect_and_retry, %DBConnection.ConnectionError{}, state}
   def handle_close(%Query{} = query, opts, s) do
-    with_pending_telemetry(query, s, &close_query(query, opts, &1))
+    case pop_telemetry(s, query) do
+      {nil, s} ->
+        stop_pending_telemetry(close_query(query, opts, s))
+
+      {telemetry, s} ->
+        result = Telemetry.run(telemetry, fn -> close_query(query, opts, s) end)
+        Telemetry.stop(telemetry, Keyword.fetch!(opts, :raised))
+        stop_pending_telemetry(result)
+    end
   end
 
   defp close_query(%Query{ref: ref} = query, opts, %{postgres: {_, ref}} = s) do
