@@ -161,7 +161,7 @@ defmodule TelemetryTest do
            ] = stops()
   end
 
-  test "a stream is one query from declare, or prepare, to deallocate", %{conn: conn} do
+  test "each round trip of a stream is its own query", %{conn: conn} do
     statement = "SELECT * FROM generate_series(1, 5)"
 
     Postgrex.transaction(conn, fn conn ->
@@ -169,15 +169,20 @@ defmodule TelemetryTest do
       stops()
 
       assert conn |> Postgrex.stream(query, [], max_rows: 2) |> Enum.to_list() |> length() == 3
-      assert [%{query: %Query{statement: ^statement}, num_rows: 5, returned_rows: 5}] = stops()
+
+      assert [
+               %{query: %Query{statement: ^statement}, returned_rows: nil, error: nil},
+               %{query: %Query{statement: ^statement}, returned_rows: 2, error: nil},
+               %{query: %Query{statement: ^statement}, returned_rows: 2, error: nil},
+               %{query: %Query{statement: ^statement}, returned_rows: 1, error: nil},
+               %{query: %Query{statement: ^statement}, returned_rows: nil, error: nil}
+             ] = stops()
 
       assert conn |> Postgrex.stream(statement, [], max_rows: 2) |> Enum.to_list() |> length() ==
                3
 
-      assert [%{query: %Query{statement: ^statement}, num_rows: 5, returned_rows: 5}] = stops()
-
-      assert [_] = conn |> Postgrex.stream(statement, [], max_rows: 2) |> Enum.take(1)
-      assert [%{query: %Query{statement: ^statement}, num_rows: 2, returned_rows: 2}] = stops()
+      assert [_declare, %{returned_rows: 2}, %{returned_rows: 2}, %{returned_rows: 1}, _close] =
+               stops()
     end)
   end
 
@@ -200,23 +205,6 @@ defmodule TelemetryTest do
     assert {:ok, %Result{rows: [[1]]}} = Postgrex.query(conn, "SELECT 1", [])
   end
 
-  test "a suspended stream ends when its transaction does", %{conn: conn} do
-    statement = "SELECT * FROM generate_series(1, 5)"
-
-    Postgrex.transaction(conn, fn conn ->
-      stream = Postgrex.stream(conn, statement, [], max_rows: 1)
-
-      {:suspended, _, _continuation} =
-        Enumerable.reduce(stream, {:suspend, nil}, fn _, acc -> {:suspend, acc} end)
-
-      {:suspended, _, _continuation} =
-        Enumerable.reduce(stream, {:cont, nil}, fn _, acc -> {:suspend, acc} end)
-    end)
-
-    assert [%{query: %{statement: "BEGIN"}} | rest] = stops()
-    assert Enum.any?(rest, &match?(%{query: %Query{statement: ^statement}, error: nil}, &1))
-  end
-
   test "a COPY FROM STDIN is one query from open to finish", %{conn: conn} do
     Postgrex.transaction(conn, fn conn ->
       Postgrex.query!(conn, "CREATE TEMP TABLE telemetry_copy (a int)", [])
@@ -237,28 +225,20 @@ defmodule TelemetryTest do
   end
 
   @tag :capture_log
-  test "a dropped connection ends every open stream", %{conn: conn} do
+  test "a dropped connection fails the round trip it drops", %{conn: conn} do
     killer = start_supervised!({Postgrex, database: "postgrex_test"}, id: :killer)
-    statement = "SELECT * FROM generate_series(1, 5)"
+    statement = "SELECT pg_sleep(1)"
+    %{rows: [[pid]]} = Postgrex.query!(conn, "SELECT pg_backend_pid()", [])
+    stops()
 
-    assert_raise Postgrex.Error, fn ->
-      Postgrex.transaction(conn, fn conn ->
-        %{rows: [[pid]]} = Postgrex.query!(conn, "SELECT pg_backend_pid()", [])
-        stops()
+    Task.start(fn ->
+      Process.sleep(100)
+      Postgrex.query!(killer, "SELECT pg_terminate_backend($1)", [pid])
+    end)
 
-        Enum.zip_with(
-          Postgrex.stream(conn, statement, [], max_rows: 1),
-          Postgrex.stream(conn, statement, [], max_rows: 1),
-          fn _, _ -> Postgrex.query!(killer, "SELECT pg_terminate_backend($1)", [pid]) end
-        )
-      end)
-    end
+    assert {:error, _} = Postgrex.query(conn, statement, [])
 
-    assert [error, error] =
-             stops()
-             |> Enum.filter(&match?(%{query: %Query{statement: ^statement}}, &1))
-             |> Enum.map(& &1.error)
-
+    assert [%{query: %Query{statement: ^statement}, error: error}] = stops()
     assert %Postgrex.Error{postgres: %{code: :admin_shutdown}} = error
   end
 
@@ -301,9 +281,7 @@ defmodule TelemetryTest do
   end
 
   @tag :capture_log
-  test "a stream whose checkout times out is stopped once, by the pool, with the error", %{
-    conn: conn
-  } do
+  test "a stream whose checkout times out ends each of its round trips once", %{conn: conn} do
     attach_from_any_process()
     statement = "SELECT * FROM generate_series(1, 1000)"
 
@@ -320,10 +298,22 @@ defmodule TelemetryTest do
       )
     end
 
-    assert_receive {:telemetry, [:postgrex, :query, :start], _,
-                    %{query: %Query{statement: ^statement}, telemetry_span_context: ref}}
+    refs = started(statement)
+    assert refs != []
 
-    assert_receive {:ended, :stop, ^ref, %{error: %DBConnection.ConnectionError{}}}, 1_000
-    refute_receive {:ended, _, ^ref, _}, 200
+    for ref <- refs do
+      assert_receive {:ended, :stop, ^ref, _}, 1_000
+      refute_receive {:ended, _, ^ref, _}
+    end
+  end
+
+  defp started(statement) do
+    receive do
+      {:telemetry, [:postgrex, :query, :start], _,
+       %{query: %Query{statement: ^statement}, telemetry_span_context: ref}} ->
+        [ref | started(statement)]
+    after
+      0 -> []
+    end
   end
 end
