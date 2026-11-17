@@ -24,8 +24,11 @@ defmodule TelemetryTest do
 
   defp stops do
     receive do
-      {:telemetry, [:postgrex, :query, :stop], _, metadata} -> [metadata | stops()]
-      {:telemetry, _, _, _} -> stops()
+      {:telemetry, [:postgrex, :query, :start], _, %{telemetry_span_context: span_context}} ->
+        assert_receive {:telemetry, [:postgrex, :query, :stop], _,
+                        %{telemetry_span_context: ^span_context} = metadata}
+
+        [metadata | stops()]
     after
       100 -> []
     end
@@ -67,6 +70,28 @@ defmodule TelemetryTest do
 
     assert {:ok, _, %Result{rows: [[7]]}} = Postgrex.execute(conn, query, [7])
     assert [%{query: %Query{name: "telemetry_named"}, num_rows: 1, error: nil}] = stops()
+
+    assert :ok = Postgrex.close(conn, query)
+    assert stops() == []
+  end
+
+  test "a prepared query whose parameters fail to encode ends when it is closed", %{conn: conn} do
+    Enum.each(
+      [
+        fn -> Postgrex.query(conn, "SELECT $1::int2", [100_000]) end,
+        fn -> Postgrex.prepare_execute(conn, "", "SELECT $1::int2", [100_000]) end,
+        fn -> Postgrex.prepare_execute(conn, "telemetry_encode", "SELECT $1::int2", [100_000]) end
+      ],
+      fn run ->
+        assert_raise DBConnection.EncodeError, run
+
+        assert [%{query: %Query{statement: "SELECT $1::int2"}, num_rows: nil, error: nil}] =
+                 stops()
+      end
+    )
+
+    assert {:ok, _} = Postgrex.query(conn, "SELECT 1", [])
+    assert [%{query: %Query{statement: "SELECT 1"}}] = stops()
   end
 
   test "prepare_execute is one query", %{conn: conn} do

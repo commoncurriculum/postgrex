@@ -38,8 +38,7 @@ defmodule Postgrex.Protocol do
             database: nil,
             hostname: nil,
             port: nil,
-            telemetry: nil,
-            portals: %{}
+            telemetry: %{}
 
   @type state :: %__MODULE__{
           sock: {module, any},
@@ -60,8 +59,7 @@ defmodule Postgrex.Protocol do
           database: nil | String.t(),
           hostname: nil | String.t() | {:local, String.t()},
           port: nil | :inet.port_number(),
-          telemetry: nil | {reference, Postgrex.Telemetry.t()},
-          portals: %{reference => Postgrex.Telemetry.t()}
+          telemetry: %{reference => Postgrex.Telemetry.t()}
         }
 
   @type notify :: (binary, binary -> any)
@@ -515,7 +513,7 @@ defmodule Postgrex.Protocol do
           | {:disconnect, %RuntimeError{}, state}
           | {:disconnect, %DBConnection.ConnectionError{}, state}
   def handle_execute(%Copy{ref: ref} = copy, {:copy_data, iodata}, opts, s) do
-    with_portal_telemetry(copy, s, fn s ->
+    with_pending_telemetry(copy, s, fn s ->
       case s do
         %{postgres: {_, ^ref}} ->
           copy_in_data(s, copy, iodata)
@@ -530,7 +528,7 @@ defmodule Postgrex.Protocol do
   end
 
   def handle_execute(%Copy{ref: ref, query: query} = copy, :copy_done, opts, s) do
-    with_portal_telemetry(copy, s, fn s ->
+    with_pending_telemetry(copy, s, fn s ->
       case s do
         %{postgres: {_, ^ref}} ->
           copy_in_done(s, new_status(opts), copy)
@@ -587,18 +585,20 @@ defmodule Postgrex.Protocol do
           | {:error, %ArgumentError{} | Postgrex.Error.t(), state}
           | {:disconnect, %RuntimeError{}, state}
           | {:disconnect | :disconnect_and_retry, %DBConnection.ConnectionError{}, state}
-  def handle_close(%Query{ref: ref} = query, opts, %{postgres: {_, ref}} = s) do
-    with_telemetry(query, opts, s, fn s ->
-      result = flushed_close(s, new_status(opts), query)
-      handle_disconnect_retry(result)
-    end)
+  def handle_close(%Query{} = query, opts, s) do
+    with_pending_telemetry(query, s, &close_query(query, opts, &1))
   end
 
-  def handle_close(%Query{} = query, _, %{postgres: {_, _}} = s) do
+  defp close_query(%Query{ref: ref} = query, opts, %{postgres: {_, ref}} = s) do
+    result = flushed_close(s, new_status(opts), query)
+    handle_disconnect_retry(result)
+  end
+
+  defp close_query(%Query{} = query, _, %{postgres: {_, _}} = s) do
     lock_error(s, :close, query)
   end
 
-  def handle_close(%Query{} = query, opts, s) do
+  defp close_query(%Query{} = query, opts, s) do
     result = close(s, new_status(opts), query)
     handle_disconnect_retry(result)
   end
@@ -631,7 +631,7 @@ defmodule Postgrex.Protocol do
           | {:disconnect, %RuntimeError{}, state}
           | {:disconnect, %DBConnection.ConnectionError{}, state}
   def handle_fetch(query, cursor, opts, s) do
-    with_portal_telemetry(cursor, s, &fetch(query, cursor, opts, &1))
+    with_pending_telemetry(cursor, s, &fetch(query, cursor, opts, &1))
   end
 
   defp fetch(query, cursor, opts, %{postgres: {_, ref}} = s) do
@@ -658,7 +658,7 @@ defmodule Postgrex.Protocol do
           | {:disconnect, %RuntimeError{}, state}
           | {:disconnect, %DBConnection.ConnectionError{}, state}
   def handle_deallocate(query, %Cursor{} = cursor, opts, s) do
-    with_portal_telemetry(cursor, s, &deallocate(query, cursor, opts, &1))
+    with_pending_telemetry(cursor, s, &deallocate(query, cursor, opts, &1))
   end
 
   defp deallocate(query, %Cursor{ref: ref}, opts, %{postgres: {_, ref}} = s) do
@@ -2240,14 +2240,14 @@ defmodule Postgrex.Protocol do
   ## telemetry
 
   defp with_telemetry(query, opts, s, fun) do
-    telemetry =
-      case {s, query} do
-        {%{telemetry: {ref, telemetry}}, %Query{ref: ref}} -> telemetry
-        _ -> Telemetry.start(telemetry_metadata(query, opts, s))
+    {telemetry, s} =
+      case pop_telemetry(s, query) do
+        {nil, s} -> {Telemetry.start(telemetry_metadata(query, opts, s)), s}
+        pending -> pending
       end
 
     telemetry
-    |> Telemetry.run(fn -> fun.(%{s | telemetry: nil}) end)
+    |> Telemetry.run(fn -> fun.(s) end)
     |> finish_telemetry(telemetry, Keyword.get(opts, :postgrex_execute, false))
   end
 
@@ -2258,48 +2258,55 @@ defmodule Postgrex.Protocol do
   end
 
   defp finish_telemetry({:ok, %Query{ref: ref} = query, %{postgres: {_, ref}} = s}, telemetry, _) do
-    {:ok, query, %{s | telemetry: {ref, telemetry}}}
+    {:ok, query, put_telemetry(s, ref, telemetry)}
   end
 
   defp finish_telemetry({:ok, %Query{ref: ref} = query, s}, telemetry, true = _execute?) do
-    {:ok, query, %{s | telemetry: {ref, telemetry}}}
+    {:ok, query, put_telemetry(s, ref, telemetry)}
   end
 
   defp finish_telemetry({:ok, query, %struct{ref: ref} = portal, s}, telemetry, _)
        when struct in [Cursor, Copy] do
-    {:ok, query, portal, put_portal_telemetry(s, ref, telemetry)}
+    {:ok, query, portal, put_telemetry(s, ref, telemetry)}
   end
 
   defp finish_telemetry(result, telemetry, _), do: stop_telemetry(result, telemetry)
 
-  defp with_portal_telemetry(%{ref: ref}, %{portals: portals} = s, fun) do
-    case Map.pop(portals, ref) do
-      {nil, _} ->
+  defp with_pending_telemetry(%{ref: ref} = resource, s, fun) do
+    case pop_telemetry(s, resource) do
+      {nil, s} ->
         fun.(s)
 
-      {telemetry, portals} ->
+      {telemetry, s} ->
         telemetry
-        |> Telemetry.run(fn -> fun.(%{s | portals: portals}) end)
-        |> finish_portal_telemetry(ref, telemetry)
+        |> Telemetry.run(fn -> fun.(s) end)
+        |> finish_pending_telemetry(ref, telemetry)
     end
   end
 
-  defp finish_portal_telemetry({more, result, s}, ref, telemetry) when more in [:cont, :halt] do
-    {more, result, put_portal_telemetry(s, ref, Telemetry.add_rows(telemetry, result))}
+  defp finish_pending_telemetry({more, result, s}, ref, telemetry) when more in [:cont, :halt] do
+    {more, result, put_telemetry(s, ref, Telemetry.add_rows(telemetry, result))}
   end
 
-  defp finish_portal_telemetry(
+  defp finish_pending_telemetry(
          {:ok, query, %Postgrex.Result{command: :copy_stream} = result, s},
          ref,
          telemetry
        ) do
-    {:ok, query, result, put_portal_telemetry(s, ref, telemetry)}
+    {:ok, query, result, put_telemetry(s, ref, telemetry)}
   end
 
-  defp finish_portal_telemetry(result, _ref, telemetry), do: stop_telemetry(result, telemetry)
+  defp finish_pending_telemetry(result, _ref, telemetry), do: stop_telemetry(result, telemetry)
 
-  defp put_portal_telemetry(%{portals: portals} = s, ref, telemetry) do
-    %{s | portals: Map.put(portals, ref, telemetry)}
+  defp pop_telemetry(%{telemetry: pending} = s, %{ref: ref}) when is_reference(ref) do
+    {telemetry, pending} = Map.pop(pending, ref)
+    {telemetry, %{s | telemetry: pending}}
+  end
+
+  defp pop_telemetry(s, _query), do: {nil, s}
+
+  defp put_telemetry(%{telemetry: pending} = s, ref, telemetry) do
+    %{s | telemetry: Map.put(pending, ref, telemetry)}
   end
 
   defp stop_telemetry({:ok, _query, result, _s} = ok, telemetry) do
