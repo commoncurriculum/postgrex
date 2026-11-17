@@ -324,7 +324,9 @@ defmodule Postgrex.Protocol do
 
   @impl true
   @spec disconnect(Exception.t(), state) :: :ok
-  def disconnect(_, s) do
+  def disconnect(err, s) do
+    Enum.each(s.telemetry, fn {_ref, telemetry} -> Telemetry.stop(telemetry, err) end)
+
     # cancel the request first otherwise PostgreSQL will log
     # every time the connection is explicitly disconnected
     # because the associated PID will no longer exist.
