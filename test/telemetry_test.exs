@@ -181,6 +181,42 @@ defmodule TelemetryTest do
     end)
   end
 
+  test "a query prepared with a comment is one query, and executing it another", %{conn: conn} do
+    assert {:ok, query} = Postgrex.prepare(conn, "", "SELECT $1::int", comment: "telemetry")
+    assert [%{error: nil}] = stops()
+
+    assert {:ok, _, %Result{rows: [[7]]}} = Postgrex.execute(conn, query, [7])
+    assert [%{num_rows: 1, error: nil}] = stops()
+  end
+
+  test "closing a query prepared with a comment closes it", %{conn: conn} do
+    assert {:ok, query} = Postgrex.prepare(conn, "", "SELECT 1", comment: "telemetry")
+    assert [_] = stops()
+    assert :ok = Postgrex.close(conn, query)
+
+    assert {:ok, query} = DBConnection.prepare(conn, %Query{name: "", statement: "SELECT 1"})
+    assert [_] = stops()
+    assert {:ok, _} = DBConnection.close(conn, query)
+    assert {:ok, %Result{rows: [[1]]}} = Postgrex.query(conn, "SELECT 1", [])
+  end
+
+  test "a suspended stream ends when its transaction does", %{conn: conn} do
+    statement = "SELECT * FROM generate_series(1, 5)"
+
+    Postgrex.transaction(conn, fn conn ->
+      stream = Postgrex.stream(conn, statement, [], max_rows: 1)
+
+      {:suspended, _, _continuation} =
+        Enumerable.reduce(stream, {:suspend, nil}, fn _, acc -> {:suspend, acc} end)
+
+      {:suspended, _, _continuation} =
+        Enumerable.reduce(stream, {:cont, nil}, fn _, acc -> {:suspend, acc} end)
+    end)
+
+    assert [%{query: %{statement: "BEGIN"}} | rest] = stops()
+    assert Enum.any?(rest, &match?(%{query: %Query{statement: ^statement}, error: nil}, &1))
+  end
+
   test "a COPY FROM STDIN is one query from open to finish", %{conn: conn} do
     Postgrex.transaction(conn, fn conn ->
       Postgrex.query!(conn, "CREATE TEMP TABLE telemetry_copy (a int)", [])
