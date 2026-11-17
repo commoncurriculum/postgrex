@@ -588,15 +588,10 @@ defmodule Postgrex.Protocol do
           | {:disconnect, %RuntimeError{}, state}
           | {:disconnect | :disconnect_and_retry, %DBConnection.ConnectionError{}, state}
   def handle_close(%Query{} = query, opts, s) do
-    case pop_telemetry(s, query) do
-      {nil, s} ->
-        stop_pending_telemetry(close_query(query, opts, s))
-
-      {telemetry, s} ->
-        result = Telemetry.run(telemetry, fn -> close_query(query, opts, s) end)
-        Telemetry.stop(telemetry, Keyword.fetch!(opts, :raised))
-        stop_pending_telemetry(result)
-    end
+    {telemetry, s} = pop_telemetry(s, query)
+    result = close_query(query, opts, s)
+    if telemetry, do: Telemetry.stop(telemetry, opts[:raised])
+    stop_pending_telemetry(result)
   end
 
   defp close_query(%Query{ref: ref} = query, opts, %{postgres: {_, ref}} = s) do
@@ -725,7 +720,7 @@ defmodule Postgrex.Protocol do
     case Keyword.get(opts, :mode, :transaction) do
       :transaction when postgres == :transaction ->
         with {:ok, statement} <- build_commit_statement(opts, s) do
-          handle_transaction(statement, opts, s)
+          statement |> handle_transaction(opts, s) |> end_open_queries()
         end
 
       :savepoint when postgres == :transaction ->
@@ -751,7 +746,7 @@ defmodule Postgrex.Protocol do
     case Keyword.get(opts, :mode, :transaction) do
       :transaction when postgres in [:transaction, :error] ->
         statement = "ROLLBACK"
-        handle_transaction(statement, opts, s)
+        statement |> handle_transaction(opts, s) |> end_open_queries()
 
       :savepoint when postgres in [:transaction, :error] ->
         stmt = "ROLLBACK TO SAVEPOINT postgrex_savepoint;RELEASE SAVEPOINT postgrex_savepoint"
@@ -2258,7 +2253,7 @@ defmodule Postgrex.Protocol do
 
     telemetry
     |> Telemetry.run(fn -> fun.(s) end)
-    |> finish_telemetry(telemetry, Keyword.get(opts, :postgrex_execute, false))
+    |> finish_telemetry(telemetry, Keyword.has_key?(opts, :prepare_then))
     |> stop_pending_telemetry()
   end
 
@@ -2266,10 +2261,6 @@ defmodule Postgrex.Protocol do
     %{database: database, hostname: hostname, port: port} = s
     source = Keyword.get(opts, :source)
     %{query: query, database: database, hostname: hostname, port: port, source: source}
-  end
-
-  defp finish_telemetry({:ok, %Query{ref: ref} = query, %{postgres: {_, ref}} = s}, telemetry, _) do
-    {:ok, query, put_telemetry(s, ref, telemetry)}
   end
 
   defp finish_telemetry({:ok, %Query{ref: ref} = query, s}, telemetry, true = _execute?) do
@@ -2345,6 +2336,13 @@ defmodule Postgrex.Protocol do
   end
 
   defp stop_pending_telemetry(result), do: result
+
+  defp end_open_queries({:ok, result, %{telemetry: pending} = s}) do
+    Enum.each(pending, fn {_ref, telemetry} -> Telemetry.stop(telemetry, nil) end)
+    {:ok, result, %{s | telemetry: %{}}}
+  end
+
+  defp end_open_queries(other), do: other
 
   ## execute
 

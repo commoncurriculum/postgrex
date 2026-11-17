@@ -540,7 +540,6 @@ defmodule Postgrex do
   defp prepare_execute_opts(opts) do
     opts
     |> Keyword.put(:postgrex_prepare, comment_not_present!(opts))
-    |> Keyword.put(:postgrex_execute, true)
   end
 
   @doc """
