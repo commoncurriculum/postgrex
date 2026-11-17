@@ -55,8 +55,30 @@ defmodule TelemetryTest do
            } = start_metadata
 
     assert is_reference(span_context)
-    assert stop_metadata == Map.merge(start_metadata, %{error: nil, num_rows: 2})
+
+    assert stop_metadata ==
+             Map.merge(start_metadata, %{error: nil, num_rows: 2, returned_rows: 2})
+
     assert stops() == []
+  end
+
+  test "returned rows are only the rows the server sent back", %{conn: conn} do
+    Postgrex.transaction(conn, fn conn ->
+      Postgrex.query!(conn, "CREATE TEMP TABLE telemetry_rows (a int)", [])
+      stops()
+
+      Postgrex.query!(conn, "INSERT INTO telemetry_rows VALUES (1), (2)", [])
+      assert [%{num_rows: 2, returned_rows: nil}] = stops()
+
+      Postgrex.query!(conn, "INSERT INTO telemetry_rows VALUES (3) RETURNING a", [])
+      assert [%{num_rows: 1, returned_rows: 1}] = stops()
+
+      Postgrex.query!(conn, "UPDATE telemetry_rows SET a = a + 1", [])
+      assert [%{num_rows: 3, returned_rows: nil}] = stops()
+
+      Postgrex.query!(conn, "SELECT * FROM telemetry_rows WHERE a > 100", [])
+      assert [%{num_rows: 0, returned_rows: 0}] = stops()
+    end)
   end
 
   test "the query's source option is in the metadata", %{conn: conn} do
@@ -141,7 +163,11 @@ defmodule TelemetryTest do
     end)
 
     assert [
-             %{query: %Query{statement: "SELECT * FROM generate_series(1, 5)"}, num_rows: 5},
+             %{
+               query: %Query{statement: "SELECT * FROM generate_series(1, 5)"},
+               num_rows: 5,
+               returned_rows: 5
+             },
              %{query: %TextQuery{statement: "COMMIT"}}
            ] = stops()
   end
@@ -156,7 +182,11 @@ defmodule TelemetryTest do
     end)
 
     assert [
-             %{query: %Query{statement: "COPY telemetry_copy FROM STDIN"}, num_rows: 3},
+             %{
+               query: %Query{statement: "COPY telemetry_copy FROM STDIN"},
+               num_rows: 3,
+               returned_rows: nil
+             },
              %{query: %TextQuery{statement: "COMMIT"}}
            ] = stops()
   end
