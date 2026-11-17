@@ -1,7 +1,7 @@
 defmodule Postgrex.Protocol do
   @moduledoc false
 
-  alias Postgrex.{Types, TypeServer, Query, TextQuery, Cursor, Copy}
+  alias Postgrex.{Types, TypeServer, Query, TextQuery, Cursor, Copy, Telemetry}
   import Postgrex.{Messages, BinaryUtils}
   require Logger
   use DBConnection
@@ -34,7 +34,12 @@ defmodule Postgrex.Protocol do
             scram: nil,
             scram_cb: nil,
             disable_composite_types: false,
-            messages: []
+            messages: [],
+            database: nil,
+            hostname: nil,
+            port: nil,
+            telemetry: nil,
+            portals: %{}
 
   @type state :: %__MODULE__{
           sock: {module, any},
@@ -51,7 +56,12 @@ defmodule Postgrex.Protocol do
           transactions: :strict | :naive,
           buffer: nil | binary | :active_once,
           disconnect_on_error_codes: [atom()],
-          scram: %{atom => binary}
+          scram: %{atom => binary},
+          database: nil | String.t(),
+          hostname: nil | String.t() | {:local, String.t()},
+          port: nil | :inet.port_number(),
+          telemetry: nil | Postgrex.Telemetry.t(),
+          portals: %{reference => Postgrex.Telemetry.t()}
         }
 
   @type notify :: (binary, binary -> any)
@@ -254,6 +264,7 @@ defmodule Postgrex.Protocol do
        ) do
     with {:ok, database} <- fetch_database(opts),
          status = %{status | types_key: if(types_mod, do: {host, port, database})},
+         s = put_endpoint(s, database, host, port),
          {:ok, ret} <- connect_and_handshake(host, port, sock_opts, timeout, s, status) do
       Postgrex.Utils.set_label({Postgrex.Protocol, database})
       {:ok, ret}
@@ -282,6 +293,14 @@ defmodule Postgrex.Protocol do
 
     message = "failed to establish connection to multiple endpoints:\n\n#{concat_messages}"
     {:error, %Postgrex.Error{message: message}}
+  end
+
+  defp put_endpoint(s, database, {:local, _} = socket, _port) do
+    %{s | database: database, hostname: socket, port: nil}
+  end
+
+  defp put_endpoint(s, database, host, port) do
+    %{s | database: database, hostname: List.to_string(host), port: port}
   end
 
   defp fetch_database(opts) do
@@ -397,20 +416,22 @@ defmodule Postgrex.Protocol do
   end
 
   def handle_prepare(%Query{name: ""} = query, opts, s) do
-    prepare = Keyword.get(opts, :postgrex_prepare, false)
-    status = new_status(opts, prepare: prepare)
-    comment = Keyword.get(opts, :comment)
+    with_telemetry(query, opts, s, fn s ->
+      prepare = Keyword.get(opts, :postgrex_prepare, false)
+      status = new_status(opts, prepare: prepare)
+      comment = Keyword.get(opts, :comment)
 
-    result =
-      case prepare do
-        true ->
-          parse_describe_close(s, status, query)
+      result =
+        case prepare do
+          true ->
+            parse_describe_close(s, status, query)
 
-        false ->
-          parse_describe_flush(s, status, query, comment)
-      end
+          false ->
+            parse_describe_flush(s, status, query, comment)
+        end
 
-    handle_disconnect_retry(result)
+      handle_disconnect_retry(result)
+    end)
   end
 
   def handle_prepare(%Query{} = query, opts, %{queries: nil} = s) do
@@ -422,20 +443,22 @@ defmodule Postgrex.Protocol do
     if new_query = cached_query(s, query) do
       {:ok, new_query, s}
     else
-      prepare = Keyword.get(opts, :postgrex_prepare, false)
-      status = new_status(opts, prepare: prepare)
-      comment = Keyword.get(opts, :comment)
+      with_telemetry(query, opts, s, fn s ->
+        prepare = Keyword.get(opts, :postgrex_prepare, false)
+        status = new_status(opts, prepare: prepare)
+        comment = Keyword.get(opts, :comment)
 
-      result =
-        case prepare do
-          true -> close_parse_describe(s, status, query)
-          false -> close_parse_describe_flush(s, status, query, comment)
+        result =
+          case prepare do
+            true -> close_parse_describe(s, status, query)
+            false -> close_parse_describe_flush(s, status, query, comment)
+          end
+
+        case result do
+          {:ok, query, s} -> {:ok, query, %{s | messages: []}}
+          other -> handle_disconnect_retry(other)
         end
-
-      case result do
-        {:ok, query, s} -> {:ok, query, %{s | messages: []}}
-        other -> handle_disconnect_retry(other)
-      end
+      end)
     end
   end
 
@@ -463,23 +486,27 @@ defmodule Postgrex.Protocol do
           | {:disconnect, %RuntimeError{}, state}
           | {:disconnect | :disconnect_and_retry, %DBConnection.ConnectionError{}, state}
   def handle_execute(%Query{} = query, params, opts, s) do
-    case Keyword.get(opts, :postgrex_copy, false) do
-      true ->
-        handle_execute_copy(query, params, opts, s)
+    with_telemetry(query, opts, s, fn s ->
+      case Keyword.get(opts, :postgrex_copy, false) do
+        true ->
+          handle_execute_copy(query, params, opts, s)
 
-      false ->
-        handle_execute_result(query, params, opts, s)
-    end
+        false ->
+          handle_execute_result(query, params, opts, s)
+      end
+    end)
   end
 
   def handle_execute(%TextQuery{statement: statement} = query, [], opts, s) do
-    case handle_simple(statement, opts, s) do
-      {:ok, [first_result | _], s} ->
-        {:ok, query, first_result, s}
+    with_telemetry(query, opts, s, fn s ->
+      case handle_simple(statement, opts, s) do
+        {:ok, [first_result | _], s} ->
+          {:ok, query, first_result, s}
 
-      {error, _, _} = other when error in [:error, :disconnect] ->
-        other
-    end
+        {error, _, _} = other when error in [:error, :disconnect] ->
+          other
+      end
+    end)
   end
 
   @spec handle_execute(Postgrex.Copy.t(), {:copy_data, iodata} | :copy_done, Keyword.t(), state) ::
@@ -488,31 +515,35 @@ defmodule Postgrex.Protocol do
           | {:disconnect, %RuntimeError{}, state}
           | {:disconnect, %DBConnection.ConnectionError{}, state}
   def handle_execute(%Copy{ref: ref} = copy, {:copy_data, iodata}, opts, s) do
-    case s do
-      %{postgres: {_, ^ref}} ->
-        copy_in_data(s, copy, iodata)
+    with_portal_telemetry(copy, s, fn s ->
+      case s do
+        %{postgres: {_, ^ref}} ->
+          copy_in_data(s, copy, iodata)
 
-      %{postgres: {_, _}} ->
-        lock_error(s, :execute, copy)
+        %{postgres: {_, _}} ->
+          lock_error(s, :execute, copy)
 
-      _ ->
-        copy_in_data(s, new_status(opts), copy, iodata)
-    end
+        _ ->
+          copy_in_data(s, new_status(opts), copy, iodata)
+      end
+    end)
   end
 
   def handle_execute(%Copy{ref: ref, query: query} = copy, :copy_done, opts, s) do
-    case s do
-      %{postgres: {_, ^ref}} ->
-        copy_in_done(s, new_status(opts), copy)
+    with_portal_telemetry(copy, s, fn s ->
+      case s do
+        %{postgres: {_, ^ref}} ->
+          copy_in_done(s, new_status(opts), copy)
 
-      %{postgres: {_, _}} ->
-        lock_error(s, :execute, copy)
+        %{postgres: {_, _}} ->
+          lock_error(s, :execute, copy)
 
-      _ ->
-        with {:ok, result, s} <- close(s, new_status(opts), copy) do
-          {:ok, query, result, s}
-        end
-    end
+        _ ->
+          with {:ok, result, s} <- close(s, new_status(opts), copy) do
+            {:ok, query, result, s}
+          end
+      end
+    end)
   end
 
   defp handle_execute_result(%{ref: ref} = query, params, opts, %{postgres: {_, ref}} = s) do
@@ -557,8 +588,10 @@ defmodule Postgrex.Protocol do
           | {:disconnect, %RuntimeError{}, state}
           | {:disconnect | :disconnect_and_retry, %DBConnection.ConnectionError{}, state}
   def handle_close(%Query{ref: ref} = query, opts, %{postgres: {_, ref}} = s) do
-    result = flushed_close(s, new_status(opts), query)
-    handle_disconnect_retry(result)
+    with_telemetry(query, opts, s, fn s ->
+      result = flushed_close(s, new_status(opts), query)
+      handle_disconnect_retry(result)
+    end)
   end
 
   def handle_close(%Query{} = query, _, %{postgres: {_, _}} = s) do
@@ -577,16 +610,18 @@ defmodule Postgrex.Protocol do
           | {:disconnect, %RuntimeError{}, state}
           | {:disconnect, %DBConnection.ConnectionError{}, state}
   def handle_declare(query, params, opts, s) do
-    %{connection_id: connection_id} = s
+    with_telemetry(query, opts, s, fn s ->
+      %{connection_id: connection_id} = s
 
-    cursor = %Cursor{
-      portal: make_portal(),
-      ref: make_ref(),
-      connection_id: connection_id,
-      mode: mode(opts)
-    }
+      cursor = %Cursor{
+        portal: make_portal(),
+        ref: make_ref(),
+        connection_id: connection_id,
+        mode: mode(opts)
+      }
 
-    handle_bind(query, params, cursor, opts, s)
+      handle_bind(query, params, cursor, opts, s)
+    end)
   end
 
   @impl true
@@ -595,7 +630,11 @@ defmodule Postgrex.Protocol do
           | {:error, Postgrex.Error.t(), state}
           | {:disconnect, %RuntimeError{}, state}
           | {:disconnect, %DBConnection.ConnectionError{}, state}
-  def handle_fetch(query, cursor, opts, %{postgres: {_, ref}} = s) do
+  def handle_fetch(query, cursor, opts, s) do
+    with_portal_telemetry(cursor, s, &fetch(query, cursor, opts, &1))
+  end
+
+  defp fetch(query, cursor, opts, %{postgres: {_, ref}} = s) do
     case cursor do
       %Cursor{ref: ^ref, mode: mode} ->
         status = new_status(opts, mode: mode)
@@ -607,7 +646,7 @@ defmodule Postgrex.Protocol do
     end
   end
 
-  def handle_fetch(query, cursor, opts, s) do
+  defp fetch(query, cursor, opts, s) do
     max_rows = Keyword.get(opts, :max_rows, @max_rows)
     execute(s, new_status(opts), query, cursor, max_rows)
   end
@@ -618,15 +657,19 @@ defmodule Postgrex.Protocol do
           | {:error, Postgrex.Error.t(), state}
           | {:disconnect, %RuntimeError{}, state}
           | {:disconnect, %DBConnection.ConnectionError{}, state}
-  def handle_deallocate(query, %Cursor{ref: ref}, opts, %{postgres: {_, ref}} = s) do
+  def handle_deallocate(query, %Cursor{} = cursor, opts, s) do
+    with_portal_telemetry(cursor, s, &deallocate(query, cursor, opts, &1))
+  end
+
+  defp deallocate(query, %Cursor{ref: ref}, opts, %{postgres: {_, ref}} = s) do
     copy_out_done(s, new_status(opts), query)
   end
 
-  def handle_deallocate(_, %Cursor{} = cursor, _, %{postgres: {_, _}} = s) do
+  defp deallocate(_, %Cursor{} = cursor, _, %{postgres: {_, _}} = s) do
     lock_error(s, :deallocate, cursor)
   end
 
-  def handle_deallocate(_, %Cursor{} = cursor, opts, s) do
+  defp deallocate(_, %Cursor{} = cursor, opts, s) do
     status = new_status(opts, mode: :transaction)
     close(s, status, cursor)
   end
@@ -2194,6 +2237,82 @@ defmodule Postgrex.Protocol do
     end
   end
 
+  ## telemetry
+
+  defp with_telemetry(query, opts, s, fun) do
+    telemetry =
+      case s do
+        %{postgres: {_, _}, telemetry: %{} = telemetry} -> telemetry
+        _ -> Telemetry.start(telemetry_metadata(query, opts, s))
+      end
+
+    telemetry
+    |> Telemetry.run(fn -> fun.(%{s | telemetry: nil}) end)
+    |> finish_telemetry(telemetry)
+  end
+
+  defp telemetry_metadata(query, opts, s) do
+    %{database: database, hostname: hostname, port: port} = s
+    source = Keyword.get(opts, :source)
+    %{query: query, database: database, hostname: hostname, port: port, source: source}
+  end
+
+  defp finish_telemetry({:ok, query, %{postgres: {_, _}} = s}, telemetry) do
+    {:ok, query, %{s | telemetry: telemetry}}
+  end
+
+  defp finish_telemetry({:ok, query, %struct{ref: ref} = portal, s}, telemetry)
+       when struct in [Cursor, Copy] do
+    {:ok, query, portal, put_portal_telemetry(s, ref, telemetry)}
+  end
+
+  defp finish_telemetry(result, telemetry), do: stop_telemetry(result, telemetry)
+
+  defp with_portal_telemetry(%{ref: ref}, %{portals: portals} = s, fun) do
+    case Map.pop(portals, ref) do
+      {nil, _} ->
+        fun.(s)
+
+      {telemetry, portals} ->
+        telemetry
+        |> Telemetry.run(fn -> fun.(%{s | portals: portals}) end)
+        |> finish_portal_telemetry(ref, telemetry)
+    end
+  end
+
+  defp finish_portal_telemetry({more, result, s}, ref, telemetry) when more in [:cont, :halt] do
+    {more, result, put_portal_telemetry(s, ref, Telemetry.add_rows(telemetry, result))}
+  end
+
+  defp finish_portal_telemetry(
+         {:ok, query, %Postgrex.Result{command: :copy_stream} = result, s},
+         ref,
+         telemetry
+       ) do
+    {:ok, query, result, put_portal_telemetry(s, ref, telemetry)}
+  end
+
+  defp finish_portal_telemetry(result, _ref, telemetry), do: stop_telemetry(result, telemetry)
+
+  defp put_portal_telemetry(%{portals: portals} = s, ref, telemetry) do
+    %{s | portals: Map.put(portals, ref, telemetry)}
+  end
+
+  defp stop_telemetry({:ok, _query, result, _s} = ok, telemetry) do
+    Telemetry.stop(Telemetry.add_rows(telemetry, result), nil)
+    ok
+  end
+
+  defp stop_telemetry({:ok, result, _s} = ok, telemetry) do
+    Telemetry.stop(Telemetry.add_rows(telemetry, result), nil)
+    ok
+  end
+
+  defp stop_telemetry({_error, error, _s} = failed, telemetry) do
+    Telemetry.stop(telemetry, error)
+    failed
+  end
+
   ## execute
 
   defp lock_error(s, fun) do
@@ -3079,17 +3198,19 @@ defmodule Postgrex.Protocol do
     end
   end
 
-  defp handle_transaction(statement, opts, %{buffer: buffer} = s) do
-    status = new_status(opts, mode: :transaction)
-    msgs = [msg_query(statement: statement)]
+  defp handle_transaction(statement, opts, s) do
+    with_telemetry(%TextQuery{statement: statement}, opts, s, fn %{buffer: buffer} = s ->
+      status = new_status(opts, mode: :transaction)
+      msgs = [msg_query(statement: statement)]
 
-    case msg_send(%{s | buffer: nil}, msgs, buffer) do
-      :ok ->
-        recv_transaction(s, status, buffer)
+      case msg_send(%{s | buffer: nil}, msgs, buffer) do
+        :ok ->
+          recv_transaction(s, status, buffer)
 
-      {:disconnect, err, s} ->
-        {:disconnect, err, s}
-    end
+        {:disconnect, err, s} ->
+          {:disconnect, err, s}
+      end
+    end)
   end
 
   defp recv_transaction(s, status, tags \\ [], buffer) do
