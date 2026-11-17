@@ -515,7 +515,7 @@ defmodule Postgrex.Protocol do
           | {:disconnect, %RuntimeError{}, state}
           | {:disconnect, %DBConnection.ConnectionError{}, state}
   def handle_execute(%Copy{ref: ref} = copy, {:copy_data, iodata}, opts, s) do
-    with_pending_telemetry(copy, s, fn s ->
+    with_copy_telemetry(copy, s, fn s ->
       case s do
         %{postgres: {_, ^ref}} ->
           copy_in_data(s, copy, iodata)
@@ -530,7 +530,7 @@ defmodule Postgrex.Protocol do
   end
 
   def handle_execute(%Copy{ref: ref, query: query} = copy, :copy_done, opts, s) do
-    with_pending_telemetry(copy, s, fn s ->
+    with_copy_telemetry(copy, s, fn s ->
       case s do
         %{postgres: {_, ^ref}} ->
           copy_in_done(s, new_status(opts), copy)
@@ -591,7 +591,7 @@ defmodule Postgrex.Protocol do
     {telemetry, s} = pop_telemetry(s, query)
     result = close_query(query, opts, s)
     if telemetry, do: Telemetry.stop(telemetry, opts[:raised])
-    stop_pending_telemetry(result)
+    result
   end
 
   defp close_query(%Query{ref: ref} = query, opts, %{postgres: {_, ref}} = s) do
@@ -636,7 +636,7 @@ defmodule Postgrex.Protocol do
           | {:disconnect, %RuntimeError{}, state}
           | {:disconnect, %DBConnection.ConnectionError{}, state}
   def handle_fetch(query, cursor, opts, s) do
-    with_pending_telemetry(cursor, s, &fetch(query, cursor, opts, &1))
+    with_telemetry(query, opts, s, &fetch(query, cursor, opts, &1))
   end
 
   defp fetch(query, cursor, opts, %{postgres: {_, ref}} = s) do
@@ -663,7 +663,7 @@ defmodule Postgrex.Protocol do
           | {:disconnect, %RuntimeError{}, state}
           | {:disconnect, %DBConnection.ConnectionError{}, state}
   def handle_deallocate(query, %Cursor{} = cursor, opts, s) do
-    with_pending_telemetry(cursor, s, &deallocate(query, cursor, opts, &1))
+    with_telemetry(query, opts, s, &deallocate(query, cursor, opts, &1))
   end
 
   defp deallocate(query, %Cursor{ref: ref}, opts, %{postgres: {_, ref}} = s) do
@@ -720,7 +720,7 @@ defmodule Postgrex.Protocol do
     case Keyword.get(opts, :mode, :transaction) do
       :transaction when postgres == :transaction ->
         with {:ok, statement} <- build_commit_statement(opts, s) do
-          statement |> handle_transaction(opts, s) |> end_open_queries()
+          handle_transaction(statement, opts, s)
         end
 
       :savepoint when postgres == :transaction ->
@@ -746,7 +746,7 @@ defmodule Postgrex.Protocol do
     case Keyword.get(opts, :mode, :transaction) do
       :transaction when postgres in [:transaction, :error] ->
         statement = "ROLLBACK"
-        statement |> handle_transaction(opts, s) |> end_open_queries()
+        handle_transaction(statement, opts, s)
 
       :savepoint when postgres in [:transaction, :error] ->
         stmt = "ROLLBACK TO SAVEPOINT postgrex_savepoint;RELEASE SAVEPOINT postgrex_savepoint"
@@ -2254,7 +2254,6 @@ defmodule Postgrex.Protocol do
     telemetry
     |> Telemetry.run(fn -> fun.(s) end)
     |> finish_telemetry(telemetry, Keyword.has_key?(opts, :prepare_then))
-    |> stop_pending_telemetry()
   end
 
   defp telemetry_metadata(query, opts, s) do
@@ -2267,33 +2266,25 @@ defmodule Postgrex.Protocol do
     {:ok, query, put_telemetry(s, ref, telemetry)}
   end
 
-  defp finish_telemetry({:ok, query, %struct{ref: ref} = portal, s}, telemetry, _)
-       when struct in [Cursor, Copy] do
-    {:ok, query, portal, put_telemetry(s, ref, telemetry)}
+  defp finish_telemetry({:ok, query, %Copy{ref: ref} = copy, s}, telemetry, _) do
+    {:ok, query, copy, put_telemetry(s, ref, telemetry)}
   end
 
   defp finish_telemetry(result, telemetry, _), do: stop_telemetry(result, telemetry)
 
-  defp with_pending_telemetry(%{ref: ref} = resource, s, fun) do
-    result =
-      case pop_telemetry(s, resource) do
-        {nil, s} ->
-          fun.(s)
+  defp with_copy_telemetry(%Copy{ref: ref} = copy, s, fun) do
+    case pop_telemetry(s, copy) do
+      {nil, s} ->
+        fun.(s)
 
-        {telemetry, s} ->
-          telemetry
-          |> Telemetry.run(fn -> fun.(s) end)
-          |> finish_pending_telemetry(ref, telemetry)
-      end
-
-    stop_pending_telemetry(result)
+      {telemetry, s} ->
+        telemetry
+        |> Telemetry.run(fn -> fun.(s) end)
+        |> finish_copy_telemetry(ref, telemetry)
+    end
   end
 
-  defp finish_pending_telemetry({more, result, s}, ref, telemetry) when more in [:cont, :halt] do
-    {more, result, put_telemetry(s, ref, Telemetry.add_rows(telemetry, result))}
-  end
-
-  defp finish_pending_telemetry(
+  defp finish_copy_telemetry(
          {:ok, query, %Postgrex.Result{command: :copy_stream} = result, s},
          ref,
          telemetry
@@ -2301,7 +2292,7 @@ defmodule Postgrex.Protocol do
     {:ok, query, result, put_telemetry(s, ref, telemetry)}
   end
 
-  defp finish_pending_telemetry(result, _ref, telemetry), do: stop_telemetry(result, telemetry)
+  defp finish_copy_telemetry(result, _ref, telemetry), do: stop_telemetry(result, telemetry)
 
   defp pop_telemetry(%{telemetry: pending} = s, %{ref: ref}) when is_reference(ref) do
     {telemetry, pending} = Map.pop(pending, ref)
@@ -2319,7 +2310,7 @@ defmodule Postgrex.Protocol do
     ok
   end
 
-  defp stop_telemetry({:ok, result, _s} = ok, telemetry) do
+  defp stop_telemetry({more, result, _s} = ok, telemetry) when more in [:ok, :cont, :halt] do
     Telemetry.stop(Telemetry.add_rows(telemetry, result), nil)
     ok
   end
@@ -2329,34 +2320,19 @@ defmodule Postgrex.Protocol do
     failed
   end
 
-  defp stop_pending_telemetry({disconnect, error, %{telemetry: pending} = s})
-       when disconnect in [:disconnect, :disconnect_and_retry] do
-    Enum.each(pending, fn {_ref, telemetry} -> Telemetry.stop(telemetry, error) end)
-    {disconnect, error, %{s | telemetry: %{}}}
-  end
-
-  defp stop_pending_telemetry(result), do: result
-
-  defp end_open_queries({:ok, result, %{telemetry: pending} = s}) do
-    Enum.each(pending, fn {_ref, telemetry} -> Telemetry.stop(telemetry, nil) end)
-    {:ok, result, %{s | telemetry: %{}}}
-  end
-
-  defp end_open_queries(other), do: other
-
   ## execute
 
   defp lock_error(s, fun) do
     msg = "connection is locked copying to or from the database and can not #{fun} transaction"
 
-    stop_pending_telemetry({:disconnect, RuntimeError.exception(msg), s})
+    {:disconnect, RuntimeError.exception(msg), s}
   end
 
   defp lock_error(s, fun, query) do
     msg =
       "connection is locked copying to or from the database and can not #{fun} #{inspect(query)}"
 
-    stop_pending_telemetry({:disconnect, RuntimeError.exception(msg), s})
+    {:disconnect, RuntimeError.exception(msg), s}
   end
 
   defp transaction_error(s, status) do

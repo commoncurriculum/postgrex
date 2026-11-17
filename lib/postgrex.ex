@@ -44,15 +44,15 @@ defmodule Postgrex do
   `:source` (the query's `:source` option, which Ecto sets to the table) and
   `:telemetry_span_context`.
 
-  A query is everything the server does for one statement: preparing and
-  executing it together is one query, a stream is one query from declare to
-  deallocate, and a `COPY ... FROM STDIN` is one query from the first row to
-  the last. `BEGIN`, `COMMIT`, `ROLLBACK` and savepoints are queries too. A
-  query that is prepared and then closed without being executed, as when its
-  parameters fail to encode, ends when it is closed; closing a prepared query
-  on its own is not a query. When the connection drops, every query still open
-  on it, such as each stream in a transaction, stops with the error that
-  dropped it.
+  A query is one round trip to the server: preparing and executing a
+  statement together is one query, each part of a stream (declaring it, each
+  fetch, and closing it) is its own query, and a `COPY ... FROM STDIN` is one
+  query from the first row to the last. `BEGIN`, `COMMIT`, `ROLLBACK` and
+  savepoints are queries too. A query that is prepared and then closed without
+  being executed, as when its parameters fail to encode, ends when it is
+  closed; closing a prepared query on its own is not a query. When the
+  connection drops during a `COPY`, the copy stops with the error that dropped
+  it.
   """
 
   alias Postgrex.{Query, TextQuery}
@@ -523,7 +523,8 @@ defmodule Postgrex do
           {:ok, Postgrex.Query.t(), Postgrex.Result.t()} | {:error, Postgrex.Error.t()}
   def prepare_execute(conn, name, statement, params, opts \\ []) when is_list(params) do
     query = %Query{name: name, statement: statement}
-    DBConnection.prepare_execute(conn, query, params, prepare_execute_opts(opts))
+    opts = Keyword.put(opts, :postgrex_prepare, comment_not_present!(opts))
+    DBConnection.prepare_execute(conn, query, params, opts)
   end
 
   @doc """
@@ -534,12 +535,8 @@ defmodule Postgrex do
           {Postgrex.Query.t(), Postgrex.Result.t()}
   def prepare_execute!(conn, name, statement, params, opts \\ []) when is_list(params) do
     query = %Query{name: name, statement: statement}
-    DBConnection.prepare_execute!(conn, query, params, prepare_execute_opts(opts))
-  end
-
-  defp prepare_execute_opts(opts) do
-    opts
-    |> Keyword.put(:postgrex_prepare, comment_not_present!(opts))
+    opts = Keyword.put(opts, :postgrex_prepare, comment_not_present!(opts))
+    DBConnection.prepare_execute!(conn, query, params, opts)
   end
 
   @doc """
