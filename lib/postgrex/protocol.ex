@@ -2249,6 +2249,7 @@ defmodule Postgrex.Protocol do
     telemetry
     |> Telemetry.run(fn -> fun.(s) end)
     |> finish_telemetry(telemetry, Keyword.get(opts, :postgrex_execute, false))
+    |> stop_pending_telemetry()
   end
 
   defp telemetry_metadata(query, opts, s) do
@@ -2273,15 +2274,18 @@ defmodule Postgrex.Protocol do
   defp finish_telemetry(result, telemetry, _), do: stop_telemetry(result, telemetry)
 
   defp with_pending_telemetry(%{ref: ref} = resource, s, fun) do
-    case pop_telemetry(s, resource) do
-      {nil, s} ->
-        fun.(s)
+    result =
+      case pop_telemetry(s, resource) do
+        {nil, s} ->
+          fun.(s)
 
-      {telemetry, s} ->
-        telemetry
-        |> Telemetry.run(fn -> fun.(s) end)
-        |> finish_pending_telemetry(ref, telemetry)
-    end
+        {telemetry, s} ->
+          telemetry
+          |> Telemetry.run(fn -> fun.(s) end)
+          |> finish_pending_telemetry(ref, telemetry)
+      end
+
+    stop_pending_telemetry(result)
   end
 
   defp finish_pending_telemetry({more, result, s}, ref, telemetry) when more in [:cont, :halt] do
@@ -2324,19 +2328,27 @@ defmodule Postgrex.Protocol do
     failed
   end
 
+  defp stop_pending_telemetry({disconnect, error, %{telemetry: pending} = s})
+       when disconnect in [:disconnect, :disconnect_and_retry] do
+    Enum.each(pending, fn {_ref, telemetry} -> Telemetry.stop(telemetry, error) end)
+    {disconnect, error, %{s | telemetry: %{}}}
+  end
+
+  defp stop_pending_telemetry(result), do: result
+
   ## execute
 
   defp lock_error(s, fun) do
     msg = "connection is locked copying to or from the database and can not #{fun} transaction"
 
-    {:disconnect, RuntimeError.exception(msg), s}
+    stop_pending_telemetry({:disconnect, RuntimeError.exception(msg), s})
   end
 
   defp lock_error(s, fun, query) do
     msg =
       "connection is locked copying to or from the database and can not #{fun} #{inspect(query)}"
 
-    {:disconnect, RuntimeError.exception(msg), s}
+    stop_pending_telemetry({:disconnect, RuntimeError.exception(msg), s})
   end
 
   defp transaction_error(s, status) do

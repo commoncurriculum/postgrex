@@ -50,7 +50,9 @@ defmodule Postgrex do
   the last. `BEGIN`, `COMMIT`, `ROLLBACK` and savepoints are queries too. A
   query that is prepared and then closed without being executed, as when its
   parameters fail to encode, ends when it is closed; closing a prepared query
-  on its own is not a query.
+  on its own is not a query. When the connection drops, every query still open
+  on it, such as each stream in a transaction, stops with the error that
+  dropped it.
   """
 
   alias Postgrex.{Query, TextQuery}
