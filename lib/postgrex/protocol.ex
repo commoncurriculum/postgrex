@@ -60,7 +60,7 @@ defmodule Postgrex.Protocol do
           database: nil | String.t(),
           hostname: nil | String.t() | {:local, String.t()},
           port: nil | :inet.port_number(),
-          telemetry: nil | Postgrex.Telemetry.t(),
+          telemetry: nil | {reference, Postgrex.Telemetry.t()},
           portals: %{reference => Postgrex.Telemetry.t()}
         }
 
@@ -2241,14 +2241,14 @@ defmodule Postgrex.Protocol do
 
   defp with_telemetry(query, opts, s, fun) do
     telemetry =
-      case s do
-        %{postgres: {_, _}, telemetry: %{} = telemetry} -> telemetry
+      case {s, query} do
+        {%{telemetry: {ref, telemetry}}, %Query{ref: ref}} -> telemetry
         _ -> Telemetry.start(telemetry_metadata(query, opts, s))
       end
 
     telemetry
     |> Telemetry.run(fn -> fun.(%{s | telemetry: nil}) end)
-    |> finish_telemetry(telemetry)
+    |> finish_telemetry(telemetry, Keyword.get(opts, :postgrex_execute, false))
   end
 
   defp telemetry_metadata(query, opts, s) do
@@ -2257,16 +2257,20 @@ defmodule Postgrex.Protocol do
     %{query: query, database: database, hostname: hostname, port: port, source: source}
   end
 
-  defp finish_telemetry({:ok, query, %{postgres: {_, _}} = s}, telemetry) do
-    {:ok, query, %{s | telemetry: telemetry}}
+  defp finish_telemetry({:ok, %Query{ref: ref} = query, %{postgres: {_, ref}} = s}, telemetry, _) do
+    {:ok, query, %{s | telemetry: {ref, telemetry}}}
   end
 
-  defp finish_telemetry({:ok, query, %struct{ref: ref} = portal, s}, telemetry)
+  defp finish_telemetry({:ok, %Query{ref: ref} = query, s}, telemetry, true = _execute?) do
+    {:ok, query, %{s | telemetry: {ref, telemetry}}}
+  end
+
+  defp finish_telemetry({:ok, query, %struct{ref: ref} = portal, s}, telemetry, _)
        when struct in [Cursor, Copy] do
     {:ok, query, portal, put_portal_telemetry(s, ref, telemetry)}
   end
 
-  defp finish_telemetry(result, telemetry), do: stop_telemetry(result, telemetry)
+  defp finish_telemetry(result, telemetry, _), do: stop_telemetry(result, telemetry)
 
   defp with_portal_telemetry(%{ref: ref}, %{portals: portals} = s, fun) do
     case Map.pop(portals, ref) do

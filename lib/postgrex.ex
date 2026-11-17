@@ -516,8 +516,7 @@ defmodule Postgrex do
           {:ok, Postgrex.Query.t(), Postgrex.Result.t()} | {:error, Postgrex.Error.t()}
   def prepare_execute(conn, name, statement, params, opts \\ []) when is_list(params) do
     query = %Query{name: name, statement: statement}
-    opts = Keyword.put(opts, :postgrex_prepare, comment_not_present!(opts))
-    DBConnection.prepare_execute(conn, query, params, opts)
+    DBConnection.prepare_execute(conn, query, params, prepare_execute_opts(opts))
   end
 
   @doc """
@@ -528,8 +527,13 @@ defmodule Postgrex do
           {Postgrex.Query.t(), Postgrex.Result.t()}
   def prepare_execute!(conn, name, statement, params, opts \\ []) when is_list(params) do
     query = %Query{name: name, statement: statement}
-    opts = Keyword.put(opts, :postgrex_prepare, comment_not_present!(opts))
-    DBConnection.prepare_execute!(conn, query, params, opts)
+    DBConnection.prepare_execute!(conn, query, params, prepare_execute_opts(opts))
+  end
+
+  defp prepare_execute_opts(opts) do
+    opts
+    |> Keyword.put(:postgrex_prepare, comment_not_present!(opts))
+    |> Keyword.put(:postgrex_execute, true)
   end
 
   @doc """

@@ -69,6 +69,25 @@ defmodule TelemetryTest do
     assert [%{query: %Query{name: "telemetry_named"}, num_rows: 1, error: nil}] = stops()
   end
 
+  test "prepare_execute is one query", %{conn: conn} do
+    Enum.each(["", "telemetry_prepare_execute"], fn name ->
+      assert {:ok, _, %Result{rows: [[7]]}} =
+               Postgrex.prepare_execute(conn, name, "SELECT $1::int", [7])
+
+      assert [%{query: %Query{name: ^name}, num_rows: 1, error: nil}] = stops()
+    end)
+  end
+
+  test "a failed prepare in prepare_execute ends the query", %{conn: conn} do
+    assert {:error, %Postgrex.Error{postgres: %{code: :syntax_error}}} =
+             Postgrex.prepare_execute(conn, "telemetry_bad", "SELEC 1", [])
+
+    assert [%{error: %Postgrex.Error{}}] = stops()
+
+    assert {:ok, _, _} = Postgrex.prepare_execute(conn, "telemetry_good", "SELECT 1", [])
+    assert [%{query: %Query{name: "telemetry_good"}, num_rows: 1}] = stops()
+  end
+
   test "a failed query reports the Postgres error on stop", %{conn: conn} do
     assert {:error, %Postgrex.Error{postgres: %{code: :syntax_error}}} =
              Postgrex.query(conn, "SELEC 1", [])
