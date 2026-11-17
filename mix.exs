@@ -33,7 +33,8 @@ defmodule Postgrex.Mixfile do
       {:jason, "~> 1.0", optional: true},
       {:table, "~> 0.1.0", optional: true},
       {:decimal, "~> 1.5 or ~> 2.0 or ~> 3.0"},
-      {:db_connection, "~> 2.9"},
+      {:db_connection,
+       github: "commoncurriculum/db_connection", ref: "2b90b92a68dbe7d00092131b1134573195cb6418"},
       {:telemetry, "~> 0.4 or ~> 1.0"}
     ]
   end

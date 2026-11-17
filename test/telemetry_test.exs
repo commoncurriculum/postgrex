@@ -97,7 +97,9 @@ defmodule TelemetryTest do
     assert stops() == []
   end
 
-  test "a prepared query whose parameters fail to encode ends when it is closed", %{conn: conn} do
+  test "a prepared query whose parameters fail to encode ends with the encode error", %{
+    conn: conn
+  } do
     Enum.each(
       [
         fn -> Postgrex.query(conn, "SELECT $1::int2", [100_000]) end,
@@ -107,7 +109,13 @@ defmodule TelemetryTest do
       fn run ->
         assert_raise DBConnection.EncodeError, run
 
-        assert [%{query: %Query{statement: "SELECT $1::int2"}, num_rows: nil, error: nil}] =
+        assert [
+                 %{
+                   query: %Query{statement: "SELECT $1::int2"},
+                   num_rows: nil,
+                   error: %DBConnection.EncodeError{}
+                 }
+               ] =
                  stops()
       end
     )

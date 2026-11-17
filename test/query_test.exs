@@ -2381,7 +2381,8 @@ defmodule QueryTest do
 
   defp get_socket(conn) do
     {:pool_ref, _, _, _, holder, _} = conn.pool_ref
-    [{:conn, _, _, state, _, _, _, _}] = :ets.lookup(holder, :conn)
+    [conn] = :ets.lookup(holder, :conn)
+    state = elem(conn, 3)
     {:gen_tcp, sock} = state.sock
     sock
   end
