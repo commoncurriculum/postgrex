@@ -31,9 +31,11 @@ defmodule Postgrex do
     * `[:postgrex, :query, :start]` - measurements `:system_time` and
       `:monotonic_time`
     * `[:postgrex, :query, :stop]` - measurements `:duration` and
-      `:monotonic_time`, plus metadata `:num_rows` (`nil` when the server
-      reports none) and `:error` (`nil`, or the exception the query
-      returned)
+      `:monotonic_time`, plus metadata `:num_rows` (the row count the server
+      reported, as in `Postgrex.Result`, or `nil` when it reports none),
+      `:returned_rows` (the rows the server returned, or `nil` when the
+      statement returns none, as an `INSERT` without `RETURNING` does) and
+      `:error` (`nil`, or the exception the query returned)
     * `[:postgrex, :query, :exception]` - measurements `:duration` and
       `:monotonic_time`, plus metadata `:kind`, `:reason` and `:stacktrace`
 
