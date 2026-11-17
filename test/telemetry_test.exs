@@ -193,6 +193,32 @@ defmodule TelemetryTest do
   end
 
   @tag :capture_log
+  test "a dropped connection ends every open stream", %{conn: conn} do
+    killer = start_supervised!({Postgrex, database: "postgrex_test"}, id: :killer)
+    statement = "SELECT * FROM generate_series(1, 5)"
+
+    assert_raise Postgrex.Error, fn ->
+      Postgrex.transaction(conn, fn conn ->
+        %{rows: [[pid]]} = Postgrex.query!(conn, "SELECT pg_backend_pid()", [])
+        stops()
+
+        Enum.zip_with(
+          Postgrex.stream(conn, statement, [], max_rows: 1),
+          Postgrex.stream(conn, statement, [], max_rows: 1),
+          fn _, _ -> Postgrex.query!(killer, "SELECT pg_terminate_backend($1)", [pid]) end
+        )
+      end)
+    end
+
+    assert [error, error] =
+             stops()
+             |> Enum.filter(&match?(%{query: %Query{statement: ^statement}}, &1))
+             |> Enum.map(& &1.error)
+
+    assert %Postgrex.Error{postgres: %{code: :admin_shutdown}} = error
+  end
+
+  @tag :capture_log
   test "a timed out query reports the cancellation on stop", %{conn: conn} do
     assert {:error, %Postgrex.Error{postgres: %{code: :query_canceled}}} =
              Postgrex.query(conn, "SELECT pg_sleep(1)", [], timeout: 50)
