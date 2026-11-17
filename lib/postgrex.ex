@@ -45,7 +45,10 @@ defmodule Postgrex do
   A query is everything the server does for one statement: preparing and
   executing it together is one query, a stream is one query from declare to
   deallocate, and a `COPY ... FROM STDIN` is one query from the first row to
-  the last. `BEGIN`, `COMMIT`, `ROLLBACK` and savepoints are queries too.
+  the last. `BEGIN`, `COMMIT`, `ROLLBACK` and savepoints are queries too. A
+  query that is prepared and then closed without being executed, as when its
+  parameters fail to encode, ends when it is closed; closing a prepared query
+  on its own is not a query.
   """
 
   alias Postgrex.{Query, TextQuery}
