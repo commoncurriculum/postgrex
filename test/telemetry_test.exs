@@ -116,8 +116,8 @@ defmodule TelemetryTest do
     assert [%{query: %Query{statement: "SELECT 1"}}] = stops()
   end
 
-  test "prepare_execute is one query", %{conn: conn} do
-    Enum.each(["", "telemetry_prepare_execute"], fn name ->
+  test "prepare_execute is one query, prepared or cached", %{conn: conn} do
+    Enum.each(["", "telemetry_prepare_execute", "telemetry_prepare_execute"], fn name ->
       assert {:ok, _, %Result{rows: [[7]]}} =
                Postgrex.prepare_execute(conn, name, "SELECT $1::int", [7])
 
@@ -153,23 +153,24 @@ defmodule TelemetryTest do
            ] = stops()
   end
 
-  test "a stream is one query from declare to deallocate", %{conn: conn} do
+  test "a stream is one query from declare, or prepare, to deallocate", %{conn: conn} do
+    statement = "SELECT * FROM generate_series(1, 5)"
+
     Postgrex.transaction(conn, fn conn ->
-      query = Postgrex.prepare!(conn, "", "SELECT * FROM generate_series(1, 5)")
+      query = Postgrex.prepare!(conn, "", statement)
       stops()
 
-      chunks = conn |> Postgrex.stream(query, [], max_rows: 2) |> Enum.to_list()
-      assert length(chunks) == 3
-    end)
+      assert conn |> Postgrex.stream(query, [], max_rows: 2) |> Enum.to_list() |> length() == 3
+      assert [%{query: %Query{statement: ^statement}, num_rows: 5, returned_rows: 5}] = stops()
 
-    assert [
-             %{
-               query: %Query{statement: "SELECT * FROM generate_series(1, 5)"},
-               num_rows: 5,
-               returned_rows: 5
-             },
-             %{query: %TextQuery{statement: "COMMIT"}}
-           ] = stops()
+      assert conn |> Postgrex.stream(statement, [], max_rows: 2) |> Enum.to_list() |> length() ==
+               3
+
+      assert [%{query: %Query{statement: ^statement}, num_rows: 5, returned_rows: 5}] = stops()
+
+      assert [_] = conn |> Postgrex.stream(statement, [], max_rows: 2) |> Enum.take(1)
+      assert [%{query: %Query{statement: ^statement}, num_rows: 2, returned_rows: 2}] = stops()
+    end)
   end
 
   test "a COPY FROM STDIN is one query from open to finish", %{conn: conn} do
