@@ -3,6 +3,7 @@
 ## v0.23.0-dev
 
 * Enhancements
+  * Emit `[:postgrex, :query, :start | :stop | :exception]` telemetry for every query
   * Add SCRAM-SHA-256-PLUS support
   * Use reports for logging errors
   * Support arrays of domains defined over arrays

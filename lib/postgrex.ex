@@ -21,6 +21,31 @@ defmodule Postgrex do
   Note that the notifications API (pub/sub) supported by PostgreSQL is
   handled by `Postgrex.Notifications`. Hence, to use this feature,
   you need to start a separate (notifications) connection.
+
+  ## Telemetry
+
+  Every query sent to the server emits `:telemetry` span events from the
+  process that runs it, whether it comes from this module, Ecto, or
+  `DBConnection` directly:
+
+    * `[:postgrex, :query, :start]` - measurements `:system_time` and
+      `:monotonic_time`
+    * `[:postgrex, :query, :stop]` - measurements `:duration` and
+      `:monotonic_time`, plus metadata `:num_rows` (`nil` when the server
+      reports none) and `:error` (`nil`, or the exception the query
+      returned)
+    * `[:postgrex, :query, :exception]` - measurements `:duration` and
+      `:monotonic_time`, plus metadata `:kind`, `:reason` and `:stacktrace`
+
+  All three carry `:query` (a `Postgrex.Query` or `Postgrex.TextQuery`),
+  `:database`, `:hostname` (`{:local, path}` for a Unix socket), `:port`,
+  `:source` (the query's `:source` option, which Ecto sets to the table) and
+  `:telemetry_span_context`.
+
+  A query is everything the server does for one statement: preparing and
+  executing it together is one query, a stream is one query from declare to
+  deallocate, and a `COPY ... FROM STDIN` is one query from the first row to
+  the last. `BEGIN`, `COMMIT`, `ROLLBACK` and savepoints are queries too.
   """
 
   alias Postgrex.{Query, TextQuery}
