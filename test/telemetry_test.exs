@@ -227,11 +227,67 @@ defmodule TelemetryTest do
   end
 
   @tag :capture_log
-  test "a timed out query reports the cancellation on stop", %{conn: conn} do
+  # The query times out and the pool times out the checkout at the same moment: whichever comes
+  # first ends the query, the other is ignored.
+  test "a timed out query is stopped once, with the cancellation or the checkout timeout", %{
+    conn: conn
+  } do
+    attach_from_any_process()
+
     assert {:error, %Postgrex.Error{postgres: %{code: :query_canceled}}} =
              Postgrex.query(conn, "SELECT pg_sleep(1)", [], timeout: 50)
 
-    assert [%{query: %Query{statement: "SELECT pg_sleep(1)"}, error: error}] = stops()
-    assert %Postgrex.Error{postgres: %{code: :query_canceled}} = error
+    assert_receive {:telemetry, [:postgrex, :query, :start], _,
+                    %{query: %Query{statement: "SELECT pg_sleep(1)"}, telemetry_span_context: ref}}
+
+    assert_receive {:ended, :stop, ^ref, %{error: error}}, 1_000
+    refute_receive {:ended, _, ^ref, _}, 200
+
+    assert match?(%Postgrex.Error{postgres: %{code: :query_canceled}}, error) or
+             match?(%DBConnection.ConnectionError{}, error)
+  end
+
+  def send_from_any_process(event, _measurements, metadata, test) do
+    send(test, {:ended, List.last(event), metadata.telemetry_span_context, metadata})
+  end
+
+  defp attach_from_any_process do
+    handler_id = make_ref()
+
+    :telemetry.attach_many(
+      handler_id,
+      [[:postgrex, :query, :stop], [:postgrex, :query, :exception]],
+      &__MODULE__.send_from_any_process/4,
+      self()
+    )
+
+    on_exit(fn -> :telemetry.detach(handler_id) end)
+  end
+
+  @tag :capture_log
+  test "a stream whose checkout times out is stopped once, by the pool, with the error", %{
+    conn: conn
+  } do
+    attach_from_any_process()
+    statement = "SELECT * FROM generate_series(1, 1000)"
+
+    assert_raise DBConnection.ConnectionError, fn ->
+      Postgrex.transaction(
+        conn,
+        fn conn ->
+          conn
+          |> Postgrex.stream(statement, [], max_rows: 1)
+          |> Stream.each(fn _ -> Process.sleep(50) end)
+          |> Stream.run()
+        end,
+        timeout: 300
+      )
+    end
+
+    assert_receive {:telemetry, [:postgrex, :query, :start], _,
+                    %{query: %Query{statement: ^statement}, telemetry_span_context: ref}}
+
+    assert_receive {:ended, :stop, ^ref, %{error: %DBConnection.ConnectionError{}}}, 1_000
+    refute_receive {:ended, _, ^ref, _}, 200
   end
 end

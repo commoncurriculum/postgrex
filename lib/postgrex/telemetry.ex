@@ -1,11 +1,15 @@
 defmodule Postgrex.Telemetry do
   @moduledoc false
 
+  # A query can be ended from two processes: the caller, and the pool's connection process when
+  # it disconnects with the state the caller last saved. `ended` makes sure only one of them
+  # emits the stop or exception event.
   @type t :: %{
           start_time: integer,
           metadata: map,
           num_rows: non_neg_integer | nil,
-          returned_rows: non_neg_integer | nil
+          returned_rows: non_neg_integer | nil,
+          ended: :atomics.atomics_ref()
         }
 
   @spec start(map) :: t
@@ -14,17 +18,28 @@ defmodule Postgrex.Telemetry do
     start_time = System.monotonic_time()
     measurements = %{system_time: System.system_time(), monotonic_time: start_time}
     :telemetry.execute([:postgrex, :query, :start], measurements, metadata)
-    %{start_time: start_time, metadata: metadata, num_rows: nil, returned_rows: nil}
+
+    %{
+      start_time: start_time,
+      metadata: metadata,
+      num_rows: nil,
+      returned_rows: nil,
+      ended: :atomics.new(1, [])
+    }
   end
 
   @spec stop(t, term) :: :ok
   def stop(telemetry, error) do
-    %{start_time: start_time, metadata: metadata} = telemetry
-    stop_time = System.monotonic_time()
-    measurements = %{duration: stop_time - start_time, monotonic_time: stop_time}
-    rows = Map.take(telemetry, [:num_rows, :returned_rows])
-    metadata = metadata |> Map.merge(rows) |> Map.put(:error, error)
-    :telemetry.execute([:postgrex, :query, :stop], measurements, metadata)
+    if end_once(telemetry) do
+      %{start_time: start_time, metadata: metadata} = telemetry
+      stop_time = System.monotonic_time()
+      measurements = %{duration: stop_time - start_time, monotonic_time: stop_time}
+      rows = Map.take(telemetry, [:num_rows, :returned_rows])
+      metadata = metadata |> Map.merge(rows) |> Map.put(:error, error)
+      :telemetry.execute([:postgrex, :query, :stop], measurements, metadata)
+    end
+
+    :ok
   end
 
   @spec add_rows(t, term) :: t
@@ -43,14 +58,19 @@ defmodule Postgrex.Telemetry do
   defp add_returned_rows(telemetry, nil), do: telemetry
 
   @spec run(t, (-> result)) :: result when result: var
-  def run(%{start_time: start_time, metadata: metadata}, fun) do
+  def run(%{start_time: start_time, metadata: metadata} = telemetry, fun) do
     fun.()
   catch
     kind, reason ->
-      stop_time = System.monotonic_time()
-      measurements = %{duration: stop_time - start_time, monotonic_time: stop_time}
-      metadata = Map.merge(metadata, %{kind: kind, reason: reason, stacktrace: __STACKTRACE__})
-      :telemetry.execute([:postgrex, :query, :exception], measurements, metadata)
+      if end_once(telemetry) do
+        stop_time = System.monotonic_time()
+        measurements = %{duration: stop_time - start_time, monotonic_time: stop_time}
+        metadata = Map.merge(metadata, %{kind: kind, reason: reason, stacktrace: __STACKTRACE__})
+        :telemetry.execute([:postgrex, :query, :exception], measurements, metadata)
+      end
+
       :erlang.raise(kind, reason, __STACKTRACE__)
   end
+
+  defp end_once(%{ended: ended}), do: :atomics.compare_exchange(ended, 1, 0, 1) == :ok
 end
