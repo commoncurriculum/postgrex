@@ -57,7 +57,12 @@ defmodule TelemetryTest do
     assert is_reference(span_context)
 
     assert stop_metadata ==
-             Map.merge(start_metadata, %{error: nil, num_rows: 2, returned_rows: 2})
+             Map.merge(start_metadata, %{
+               error: nil,
+               num_rows: 2,
+               returned_rows: 2,
+               command: :select
+             })
 
     assert stops() == []
   end
@@ -79,6 +84,31 @@ defmodule TelemetryTest do
       Postgrex.query!(conn, "SELECT * FROM telemetry_rows WHERE a > 100", [])
       assert [%{num_rows: 0, returned_rows: 0}] = stops()
     end)
+  end
+
+  test "the stop names the command the server reported it ran", %{conn: conn} do
+    Postgrex.transaction(conn, fn conn ->
+      assert [%{command: :begin}] = stops()
+
+      Postgrex.query!(conn, "CREATE TEMP TABLE telemetry_commands (a int)", [])
+      assert [%{command: :create_table}] = stops()
+
+      Postgrex.query!(
+        conn,
+        "WITH v AS (SELECT 1 AS a) INSERT INTO telemetry_commands SELECT a FROM v",
+        []
+      )
+
+      assert [%{command: :insert}] = stops()
+
+      Postgrex.query!(conn, "UPDATE telemetry_commands SET a = 2", [])
+      assert [%{command: :update}] = stops()
+
+      Postgrex.query!(conn, "DELETE FROM telemetry_commands", [])
+      assert [%{command: :delete}] = stops()
+    end)
+
+    assert [%{command: :commit}] = stops()
   end
 
   test "the query's source option is in the metadata", %{conn: conn} do

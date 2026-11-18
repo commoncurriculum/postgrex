@@ -2312,12 +2312,12 @@ defmodule Postgrex.Protocol do
   end
 
   defp stop_telemetry({:ok, _query, result, _s} = ok, telemetry) do
-    Telemetry.stop(Telemetry.add_rows(telemetry, result), nil)
+    Telemetry.stop(Telemetry.add_result(telemetry, result), nil)
     ok
   end
 
   defp stop_telemetry({more, result, _s} = ok, telemetry) when more in [:ok, :cont, :halt] do
-    Telemetry.stop(Telemetry.add_rows(telemetry, result), nil)
+    Telemetry.stop(Telemetry.add_result(telemetry, result), nil)
     ok
   end
 
