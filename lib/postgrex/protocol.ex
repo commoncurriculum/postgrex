@@ -2280,23 +2280,26 @@ defmodule Postgrex.Protocol do
 
   defp prepare_next(opts) do
     case Keyword.get(opts, :prepare_then) do
-      next when next in [:execute, :declare] -> {:keep, fn {:ok, %Query{ref: ref}, _} -> ref end}
+      next when next in [:execute, :declare] -> :keep
       nil -> :stop
     end
   end
 
   defp execute_next(opts) do
     case Keyword.get(opts, :postgrex_copy, false) do
-      true -> {:keep, fn {:ok, _, %Copy{ref: ref}, _} -> ref end}
+      true -> :keep
       false -> :stop
     end
   end
 
-  defp keep_or_stop(result, telemetry, {:keep, key}) when elem(result, 0) == :ok do
-    ref = if is_function(key, 1), do: key.(result), else: key
-    s = :erlang.element(tuple_size(result), result)
-    :erlang.setelement(tuple_size(result), result, put_telemetry(s, ref, telemetry))
-  end
+  defp keep_or_stop({:ok, %Query{ref: ref} = query, s}, telemetry, :keep),
+    do: {:ok, query, put_telemetry(s, ref, telemetry)}
+
+  defp keep_or_stop({:ok, query, %Copy{ref: ref} = copy, s}, telemetry, :keep),
+    do: {:ok, query, copy, put_telemetry(s, ref, telemetry)}
+
+  defp keep_or_stop({:ok, query, result, s}, telemetry, {:keep, ref}),
+    do: {:ok, query, result, put_telemetry(s, ref, telemetry)}
 
   defp keep_or_stop(result, telemetry, _next), do: stop_telemetry(result, telemetry)
 
