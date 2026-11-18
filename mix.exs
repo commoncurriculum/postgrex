@@ -34,7 +34,7 @@ defmodule Postgrex.Mixfile do
       {:table, "~> 0.1.0", optional: true},
       {:decimal, "~> 1.5 or ~> 2.0 or ~> 3.0"},
       {:db_connection,
-       github: "commoncurriculum/db_connection", ref: "9b265ece61adddf4d3e11d0824ca3650e200932f"},
+       github: "commoncurriculum/db_connection", ref: "b1879b6d1bf5d1c7cfa98f1cd6ef06ac74e98937"},
       {:telemetry, "~> 0.4 or ~> 1.0"}
     ]
   end
