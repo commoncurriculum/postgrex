@@ -6,6 +6,7 @@ defmodule Postgrex.Telemetry do
           metadata: map,
           num_rows: non_neg_integer | nil,
           returned_rows: non_neg_integer | nil,
+          command: atom | nil,
           ended: :atomics.atomics_ref()
         }
 
@@ -21,6 +22,7 @@ defmodule Postgrex.Telemetry do
       metadata: metadata,
       num_rows: nil,
       returned_rows: nil,
+      command: nil,
       ended: :atomics.new(1, [])
     }
   end
@@ -31,8 +33,8 @@ defmodule Postgrex.Telemetry do
       %{start_time: start_time, metadata: metadata} = telemetry
       stop_time = System.monotonic_time()
       measurements = %{duration: stop_time - start_time, monotonic_time: stop_time}
-      rows = Map.take(telemetry, [:num_rows, :returned_rows])
-      metadata = metadata |> Map.merge(rows) |> Map.put(:error, error)
+      result = Map.take(telemetry, [:num_rows, :returned_rows, :command])
+      metadata = metadata |> Map.merge(result) |> Map.put(:error, error)
       :telemetry.execute([:postgrex, :query, :stop], measurements, metadata)
     end
 
@@ -44,15 +46,22 @@ defmodule Postgrex.Telemetry do
     Enum.each(pending, fn {_ref, telemetry} -> stop(telemetry, error) end)
   end
 
-  @spec add_rows(t, term) :: t
-  def add_rows(telemetry, %Postgrex.Result{num_rows: num_rows, rows: rows})
-      when is_integer(num_rows) do
+  @spec add_result(t, term) :: t
+  def add_result(telemetry, %Postgrex.Result{command: command} = result) do
+    %{telemetry | command: if(is_atom(command), do: command)}
+    |> add_rows(result)
+  end
+
+  def add_result(telemetry, _result), do: telemetry
+
+  defp add_rows(telemetry, %Postgrex.Result{num_rows: num_rows, rows: rows})
+       when is_integer(num_rows) do
     telemetry
     |> Map.update!(:num_rows, &((&1 || 0) + num_rows))
     |> add_returned_rows(rows)
   end
 
-  def add_rows(telemetry, _result), do: telemetry
+  defp add_rows(telemetry, _result), do: telemetry
 
   defp add_returned_rows(telemetry, rows) when is_list(rows),
     do: Map.update!(telemetry, :returned_rows, &((&1 || 0) + length(rows)))
