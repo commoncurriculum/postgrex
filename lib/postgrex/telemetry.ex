@@ -1,9 +1,6 @@
 defmodule Postgrex.Telemetry do
   @moduledoc false
 
-  # A query can be ended from two processes: the caller, and the pool's connection process when
-  # it disconnects with the state the caller last saved. `ended` makes sure only one of them
-  # emits the stop or exception event.
   @type t :: %{
           start_time: integer,
           metadata: map,
@@ -40,6 +37,11 @@ defmodule Postgrex.Telemetry do
     end
 
     :ok
+  end
+
+  @spec stop_all(%{reference => t}, term) :: :ok
+  def stop_all(pending, error) do
+    Enum.each(pending, fn {_ref, telemetry} -> stop(telemetry, error) end)
   end
 
   @spec add_rows(t, term) :: t

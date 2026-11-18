@@ -24,9 +24,14 @@ defmodule Postgrex do
 
   ## Telemetry
 
-  Every query sent to the server emits `:telemetry` span events from the
-  process that runs it, whether it comes from this module, Ecto, or
-  `DBConnection` directly:
+  Every query sent to the server through `Postgrex`, Ecto, or `DBConnection`
+  emits `:telemetry` span events from the process that runs it. When the pool
+  closes the connection while a query is open, such as on a timeout, the query
+  stops with the error that closed it, from the pool's connection process. A
+  caller killed mid-query emits no stop. Queries sent by
+  `Postgrex.Notifications` and `Postgrex.SimpleConnection` emit no events.
+
+  The events are:
 
     * `[:postgrex, :query, :start]` - measurements `:system_time` and
       `:monotonic_time`

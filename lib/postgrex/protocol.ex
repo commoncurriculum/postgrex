@@ -323,9 +323,13 @@ defmodule Postgrex.Protocol do
   end
 
   @impl true
+  @spec discard(Exception.t(), state) :: :ok
+  def discard(err, s), do: Telemetry.stop_all(s.telemetry, err)
+
+  @impl true
   @spec disconnect(Exception.t(), state) :: :ok
   def disconnect(err, s) do
-    Enum.each(s.telemetry, fn {_ref, telemetry} -> Telemetry.stop(telemetry, err) end)
+    Telemetry.stop_all(s.telemetry, err)
 
     # cancel the request first otherwise PostgreSQL will log
     # every time the connection is explicitly disconnected
@@ -416,7 +420,7 @@ defmodule Postgrex.Protocol do
   end
 
   def handle_prepare(%Query{name: ""} = query, opts, s) do
-    with_telemetry(query, opts, s, fn s ->
+    with_telemetry(query, opts, s, prepare_next(opts), fn s ->
       prepare = Keyword.get(opts, :postgrex_prepare, false)
       status = new_status(opts, prepare: prepare)
       comment = Keyword.get(opts, :comment)
@@ -443,7 +447,7 @@ defmodule Postgrex.Protocol do
     if new_query = cached_query(s, query) do
       {:ok, new_query, s}
     else
-      with_telemetry(query, opts, s, fn s ->
+      with_telemetry(query, opts, s, prepare_next(opts), fn s ->
         prepare = Keyword.get(opts, :postgrex_prepare, false)
         status = new_status(opts, prepare: prepare)
         comment = Keyword.get(opts, :comment)
@@ -486,7 +490,7 @@ defmodule Postgrex.Protocol do
           | {:disconnect, %RuntimeError{}, state}
           | {:disconnect | :disconnect_and_retry, %DBConnection.ConnectionError{}, state}
   def handle_execute(%Query{} = query, params, opts, s) do
-    with_telemetry(query, opts, s, fn s ->
+    with_telemetry(query, opts, s, execute_next(opts), fn s ->
       case Keyword.get(opts, :postgrex_copy, false) do
         true ->
           handle_execute_copy(query, params, opts, s)
@@ -498,7 +502,7 @@ defmodule Postgrex.Protocol do
   end
 
   def handle_execute(%TextQuery{statement: statement} = query, [], opts, s) do
-    with_telemetry(query, opts, s, fn s ->
+    with_telemetry(query, opts, s, :stop, fn s ->
       case handle_simple(statement, opts, s) do
         {:ok, [first_result | _], s} ->
           {:ok, query, first_result, s}
@@ -515,7 +519,7 @@ defmodule Postgrex.Protocol do
           | {:disconnect, %RuntimeError{}, state}
           | {:disconnect, %DBConnection.ConnectionError{}, state}
   def handle_execute(%Copy{ref: ref} = copy, {:copy_data, iodata}, opts, s) do
-    with_copy_telemetry(copy, s, fn s ->
+    with_copy_telemetry(copy, s, {:keep, ref}, fn s ->
       case s do
         %{postgres: {_, ^ref}} ->
           copy_in_data(s, copy, iodata)
@@ -530,7 +534,7 @@ defmodule Postgrex.Protocol do
   end
 
   def handle_execute(%Copy{ref: ref, query: query} = copy, :copy_done, opts, s) do
-    with_copy_telemetry(copy, s, fn s ->
+    with_copy_telemetry(copy, s, :stop, fn s ->
       case s do
         %{postgres: {_, ^ref}} ->
           copy_in_done(s, new_status(opts), copy)
@@ -588,7 +592,7 @@ defmodule Postgrex.Protocol do
           | {:disconnect, %RuntimeError{}, state}
           | {:disconnect | :disconnect_and_retry, %DBConnection.ConnectionError{}, state}
   def handle_close(%Query{} = query, opts, s) do
-    {telemetry, s} = pop_telemetry(s, query)
+    {telemetry, s} = take_telemetry(s, query)
     result = close_query(query, opts, s)
     if telemetry, do: Telemetry.stop(telemetry, opts[:raised])
     result
@@ -615,7 +619,7 @@ defmodule Postgrex.Protocol do
           | {:disconnect, %RuntimeError{}, state}
           | {:disconnect, %DBConnection.ConnectionError{}, state}
   def handle_declare(query, params, opts, s) do
-    with_telemetry(query, opts, s, fn s ->
+    with_telemetry(query, opts, s, :stop, fn s ->
       %{connection_id: connection_id} = s
 
       cursor = %Cursor{
@@ -636,7 +640,7 @@ defmodule Postgrex.Protocol do
           | {:disconnect, %RuntimeError{}, state}
           | {:disconnect, %DBConnection.ConnectionError{}, state}
   def handle_fetch(query, cursor, opts, s) do
-    with_telemetry(query, opts, s, &fetch(query, cursor, opts, &1))
+    with_telemetry(query, opts, s, :stop, &fetch(query, cursor, opts, &1))
   end
 
   defp fetch(query, cursor, opts, %{postgres: {_, ref}} = s) do
@@ -663,7 +667,7 @@ defmodule Postgrex.Protocol do
           | {:disconnect, %RuntimeError{}, state}
           | {:disconnect, %DBConnection.ConnectionError{}, state}
   def handle_deallocate(query, %Cursor{} = cursor, opts, s) do
-    with_telemetry(query, opts, s, &deallocate(query, cursor, opts, &1))
+    with_telemetry(query, opts, s, :stop, &deallocate(query, cursor, opts, &1))
   end
 
   defp deallocate(query, %Cursor{ref: ref}, opts, %{postgres: {_, ref}} = s) do
@@ -2244,16 +2248,28 @@ defmodule Postgrex.Protocol do
 
   ## telemetry
 
-  defp with_telemetry(query, opts, s, fun) do
+  defp with_telemetry(query, opts, s, next, fun) do
     {telemetry, s} =
-      case pop_telemetry(s, query) do
+      case take_telemetry(s, query) do
         {nil, s} -> {Telemetry.start(telemetry_metadata(query, opts, s)), s}
-        pending -> pending
+        taken -> taken
       end
 
     telemetry
     |> Telemetry.run(fn -> fun.(s) end)
-    |> finish_telemetry(telemetry, Keyword.has_key?(opts, :prepare_then))
+    |> keep_or_stop(telemetry, next)
+  end
+
+  defp with_copy_telemetry(%Copy{} = copy, s, next, fun) do
+    case take_telemetry(s, copy) do
+      {nil, s} ->
+        fun.(s)
+
+      {telemetry, s} ->
+        telemetry
+        |> Telemetry.run(fn -> fun.(s) end)
+        |> keep_or_stop(telemetry, next)
+    end
   end
 
   defp telemetry_metadata(query, opts, s) do
@@ -2262,44 +2278,34 @@ defmodule Postgrex.Protocol do
     %{query: query, database: database, hostname: hostname, port: port, source: source}
   end
 
-  defp finish_telemetry({:ok, %Query{ref: ref} = query, s}, telemetry, true = _execute?) do
-    {:ok, query, put_telemetry(s, ref, telemetry)}
-  end
-
-  defp finish_telemetry({:ok, query, %Copy{ref: ref} = copy, s}, telemetry, _) do
-    {:ok, query, copy, put_telemetry(s, ref, telemetry)}
-  end
-
-  defp finish_telemetry(result, telemetry, _), do: stop_telemetry(result, telemetry)
-
-  defp with_copy_telemetry(%Copy{ref: ref} = copy, s, fun) do
-    case pop_telemetry(s, copy) do
-      {nil, s} ->
-        fun.(s)
-
-      {telemetry, s} ->
-        telemetry
-        |> Telemetry.run(fn -> fun.(s) end)
-        |> finish_copy_telemetry(ref, telemetry)
+  defp prepare_next(opts) do
+    case Keyword.get(opts, :prepare_then) do
+      next when next in [:execute, :declare] -> {:keep, fn {:ok, %Query{ref: ref}, _} -> ref end}
+      nil -> :stop
     end
   end
 
-  defp finish_copy_telemetry(
-         {:ok, query, %Postgrex.Result{command: :copy_stream} = result, s},
-         ref,
-         telemetry
-       ) do
-    {:ok, query, result, put_telemetry(s, ref, telemetry)}
+  defp execute_next(opts) do
+    case Keyword.get(opts, :postgrex_copy, false) do
+      true -> {:keep, fn {:ok, _, %Copy{ref: ref}, _} -> ref end}
+      false -> :stop
+    end
   end
 
-  defp finish_copy_telemetry(result, _ref, telemetry), do: stop_telemetry(result, telemetry)
+  defp keep_or_stop(result, telemetry, {:keep, key}) when elem(result, 0) == :ok do
+    ref = if is_function(key, 1), do: key.(result), else: key
+    s = :erlang.element(tuple_size(result), result)
+    :erlang.setelement(tuple_size(result), result, put_telemetry(s, ref, telemetry))
+  end
 
-  defp pop_telemetry(%{telemetry: pending} = s, %{ref: ref}) when is_reference(ref) do
+  defp keep_or_stop(result, telemetry, _next), do: stop_telemetry(result, telemetry)
+
+  defp take_telemetry(%{telemetry: pending} = s, %{ref: ref}) when is_reference(ref) do
     {telemetry, pending} = Map.pop(pending, ref)
     {telemetry, %{s | telemetry: pending}}
   end
 
-  defp pop_telemetry(s, _query), do: {nil, s}
+  defp take_telemetry(s, _query), do: {nil, s}
 
   defp put_telemetry(%{telemetry: pending} = s, ref, telemetry) do
     %{s | telemetry: Map.put(pending, ref, telemetry)}
@@ -3206,7 +3212,7 @@ defmodule Postgrex.Protocol do
   end
 
   defp handle_transaction(statement, opts, s) do
-    with_telemetry(%TextQuery{statement: statement}, opts, s, fn %{buffer: buffer} = s ->
+    with_telemetry(%TextQuery{statement: statement}, opts, s, :stop, fn %{buffer: buffer} = s ->
       status = new_status(opts, mode: :transaction)
       msgs = [msg_query(statement: statement)]
 
